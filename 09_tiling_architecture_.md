@@ -81,21 +81,16 @@ Example:
 
 ### 1. Tile Data Structure and Storage
 
-Tiles are sophisticated data structures optimized for different aggregation types:
+Tiles in Chronon are represented as `TiledIr` objects containing timestamps and intermediate representations:
 
-```python
-class Tile:
-    """
-    Core tile structure with metadata and aggregation state
-    """
-    def __init__(self, key, window_start, window_end):
-        self.key = key                    # Entity key (e.g., user_id)
-        self.window_start = window_start  # Tile start timestamp
-        self.window_end = window_end      # Tile end timestamp
-        self.ir = None                    # Intermediate Representation
-        self.version = 1                   # Schema version
-        self.checksum = None              # Data integrity check
-        self.compression = "snappy"       # Compression algorithm
+```scala
+// From SawtoothOnlineAggregator.scala
+// Wrapper class for handling IRs in the tiled chronon use case
+case class TiledIr(ts: Long, ir: Array[Any])
+
+// Batch IR structures that hold both collapsed aggregates and tail hops
+case class BatchIr(collapsed: Array[Any], tailHops: HopsAggregator.IrMapType)
+case class FinalBatchIr(collapsed: Array[Any], tailHops: HopsAggregator.OutputArrayType)
         
 class TileKey:
     """
@@ -111,63 +106,103 @@ class TileKey:
         return f"tiles::{self.feature_name}::{self.entity_id}::{self.tile_id}"
 ```
 
-### 2. Intermediate Representations (IRs) - The Heart of Tiling
+### 2. How Chronon Merges Tiles and Batch Data - Real Implementation
 
-IRs are carefully designed data structures that maintain sufficient statistics for accurate aggregation:
+Chronon uses a sophisticated "Sawtooth" aggregation pattern that combines batch data with streaming tiles. Here's how a 7-day feature value is actually computed:
 
-```python
-# IR Types for Different Aggregations
+```scala
+// From SawtoothOnlineAggregator.scala - The core merging logic
+def lambdaAggregateIrTiled(finalBatchIr: FinalBatchIr,
+                           streamingTiledIrs: Iterator[TiledIr],
+                           queryTs: Long): Array[Any] = {
+  // Step 1: Initialize with batch IR (pre-computed aggregates)
+  val batchIr = Option(finalBatchIr).getOrElse(normalizeBatchIr(init))
+  val tiledIrs = Option(streamingTiledIrs).getOrElse(Array.empty[TiledIr].iterator)
+  
+  // Step 2: Start with collapsed batch aggregates
+  val resultIr = windowedAggregator.clone(batchIr.collapsed)
+  
+  // Step 3: Merge streaming tiles that fall within query window
+  while (tiledIrs.hasNext) {
+    val tiledIr = tiledIrs.next()
+    val tiledIrTs = tiledIr.ts
+    // Only include tiles between batch end and query time
+    if (queryTs > tiledIrTs && tiledIrTs >= batchEndTs) {
+      updateIrTiled(resultIr, tiledIr, queryTs)
+    }
+  }
+  
+  // Step 4: Merge tail hops from batch for partial windows
+  mergeTailHops(resultIr, queryTs, batchEndTs, batchIr)
+  resultIr
+}
 
-class CountIR:
-    """Simple count - just an integer"""
-    def __init__(self):
-        self.count = 0
-    
-    def update(self, value):
-        self.count += 1
-    
-    def merge(self, other):
-        self.count += other.count
-    
-    def serialize(self):
-        return struct.pack('Q', self.count)  # 8 bytes
+### 3. The Tile Merging Process - Step by Step
 
-class AverageIR:
-    """Average needs both sum and count"""
-    def __init__(self):
-        self.sum = 0.0
-        self.count = 0
-    
-    def update(self, value):
-        self.sum += value
-        self.count += 1
-    
-    def merge(self, other):
-        self.sum += other.sum
-        self.count += other.count
-    
-    def finalize(self):
-        return self.sum / self.count if self.count > 0 else None
-    
-    def serialize(self):
-        return struct.pack('dQ', self.sum, self.count)  # 16 bytes
+Here's how tiles are actually merged to compute window aggregations:
 
-class PercentileIR:
-    """Percentiles need full distribution (t-digest)"""
-    def __init__(self):
-        self.tdigest = TDigest()  # Compressed percentile approximation
-        
-    def update(self, value):
-        self.tdigest.add(value)
+```scala
+// From SawtoothMutationAggregator.scala
+def updateIrTiled(ir: Array[Any], otherIr: TiledIr, queryTs: Long): Unit = {
+  val otherIrTs = otherIr.ts
+  var i: Int = 0
+  while (i < windowedAggregator.length) {
+    val windowMillis = windowMappings(i).millis  // e.g., 7 days = 604800000 ms
+    val window = windowMappings(i).aggregationPart.window
+    val hopIndex = tailHopIndices(i)
     
-    def merge(self, other):
-        self.tdigest.merge(other.tdigest)
+    // Check if this tile falls within the window for this aggregation
+    lazy val irInWindow = 
+      (otherIrTs >= TsUtils.round(queryTs - windowMillis, hopSizes(hopIndex)) && 
+       otherIrTs < queryTs)
     
-    def get_percentile(self, p):
-        return self.tdigest.percentile(p)
+    if (window == null || irInWindow) {
+      // Merge the tile's IR with the accumulated IR
+      ir(i) = windowedAggregator(i).merge(ir(i), otherIr.ir(i))
+    }
+    i += 1
+  }
+}
+
+### 4. Tail Hops - Handling Partial Windows
+
+Chronon uses "tail hops" to handle partial aggregations at window boundaries:
+
+```scala
+// From SawtoothMutationAggregator.scala
+def mergeTailHops(ir: Array[Any], queryTs: Long, batchEndTs: Long, 
+                  batchIr: FinalBatchIr): Array[Any] = {
+  var i: Int = 0
+  while (i < windowedAggregator.length) {
+    val windowMillis = windowMappings(i).millis  // e.g., 7d = 604800000ms
+    val window = windowMappings(i).aggregationPart.window
     
-    def serialize(self):
-        return self.tdigest.to_bytes()  # Variable size, typically 1-10KB
+    if (window != null) {  // No hops for unwindowed aggregations
+      val hopIndex = tailHopIndices(i)
+      val queryTail = TsUtils.round(queryTs - windowMillis, hopSizes(hopIndex))
+      val hopIrs = batchIr.tailHops(hopIndex)
+      val relevantHops = mutable.ArrayBuffer[Any](ir(i))
+      
+      // Collect all tail hops that fall within the window
+      var idx: Int = 0
+      while (idx < hopIrs.length) {
+        val hopIr = hopIrs(idx)
+        val hopStart = hopIr.last.asInstanceOf[Long]
+        if ((batchEndTs - windowMillis) + tailBufferMillis > hopStart && 
+            hopStart >= queryTail) {
+          relevantHops += hopIr(baseIrIndices(i))
+        }
+        idx += 1
+      }
+      
+      // Bulk merge all relevant hops
+      val merged = windowedAggregator(i).bulkMerge(relevantHops.iterator)
+      ir.update(i, merged)
+    }
+    i += 1
+  }
+  ir
+}
 
 class TopKIR:
     """Top-K items with counts (Count-Min Sketch + Heap)"""
@@ -226,42 +261,62 @@ class TileHierarchy:
             return "day"
 ```
 
-## Using Tiling in Your Features
+## How Tiling is Enabled in Production
 
-Let's enable tiling for our flash sale click tracking:
+### In the Online Serving Path
 
-### Step 1: Enable Tiling in GroupBy
+Tiling is determined by the `FetchContext` and handled differently in the response handler:
 
-```python
-# Add tiling configuration
-clicks_tiled = GroupBy(
-    sources=[click_events],
-    keys=["user_id"],
-    aggregations=[
-        Aggregation(
-            input_column="click",
-            operation=Operation.COUNT,
-            windows=["12h"]
-        )
-    ],
-    online=True,
-    tiling_enabled=True  # Enable tiling!
-)
-```
-
-### Step 2: Configure Tile Size
-
-```python
-# In your serving configuration
-serving_config = {
-    "tiling_enabled": True,
-    "tile_size": "1h"  # 1-hour tiles
+```scala
+// From GroupByResponseHandler.scala
+def mergeBatchAndStreaming(requestContext: RequestContext,
+                          servingInfo: GroupByServingInfoParsed,
+                          batchResponses: BatchResponses,
+                          streamingResponses: Seq[TimedValue],
+                          aggregator: SawtoothOnlineAggregator): Array[Any] = {
+  
+  // Get batch IR from cache or decode it
+  val batchIr: FinalBatchIr = getBatchIrFromBatchResponse(
+    batchResponses, batchBytes, servingInfo, toBatchIr, requestContext.keys)
+  
+  // Check if tiling is enabled
+  if (fetchContext.isTilingEnabled) {
+    // Decode streaming data as tiles and merge
+    mergeTiledIrsFromStreaming(requestContext, servingInfo, 
+                              streamingResponses, aggregator, batchIr)
+  } else {
+    // Decode streaming data as raw events and aggregate
+    mergeRawEventsFromStreaming(requestContext.queryTimeMs, servingInfo,
+                               streamingResponses, mutations, aggregator, batchIr)
+  }
 }
 ```
 
-With 1-hour tiles and a 12-hour window:
-- Store 12 tiles per user
-- Merge 12 numbers instead of 72,000!
+### Decoding and Merging Tiles
+
+```scala
+// From GroupByResponseHandler.scala
+private def mergeTiledIrsFromStreaming(requestContext: RequestContext,
+                                       servingInfo: GroupByServingInfoParsed,
+                                       streamingResponses: Seq[TimedValue],
+                                       aggregator: SawtoothOnlineAggregator,
+                                       batchIr: FinalBatchIr): Array[Any] = {
+  
+  // Decode tiles from KV store responses
+  val tileIterator = streamingResponses.iterator
+    .filter(tVal => tVal.millis >= servingInfo.batchEndTsMillis)
+    .flatMap { tVal =>
+      Try(servingInfo.tiledCodec.decodeTileIr(tVal.bytes)) match {
+        case Success((tile, _)) => Array(TiledIr(tVal.millis, tile))
+        case Failure(_) => 
+          logger.error(s"Failed to decode tile ir for groupBy ${servingInfo.groupByOps.metaData.getName}")
+          Array.empty[TiledIr]
+      }
+    }
+  
+  // Use the tiled aggregation path
+  aggregator.lambdaAggregateFinalizedTiled(batchIr, tileIterator, requestContext.queryTimeMs)
+}
 
 ### Step 3: Deploy with Flink
 
@@ -642,36 +697,44 @@ class TileMerger:
         return [heapq.heappop(top_k)[1] for _ in range(min(k, len(top_k)))]
 ```
 
-### Complete Example: End-to-End Tile Fetch
+### Complete Example: Computing a 7-Day Sum Feature
 
-```python
-# User request: "Get user_123's transaction count for last 4 hours"
+Let's trace through a real example of computing a 7-day sum of transaction amounts:
 
-# 1. Request arrives at 14:37:25
-query_time = 1704377845  # 2024-01-04 14:37:25
+```scala
+// Example: Query for 7-day transaction sum at 2024-01-15 14:00:00
+// Given:
+//   - batchEndTs = 2024-01-14 00:00:00 (batch data up to yesterday midnight)
+//   - queryTs = 2024-01-15 14:00:00
+//   - Window = 7 days = 604800000 ms
 
-# 2. Calculate tile range (using 15-minute tiles)
-# Window: 10:37:25 - 14:37:25
-# Tiles needed: 10:30, 10:45, 11:00, ..., 14:15, 14:30
+// Step 1: Batch IR contains pre-aggregated data
+val batchIr = FinalBatchIr(
+  collapsed = Array(
+    5000.0,  // Sum for 7d window from batch (Jan 7-13)
+    // ... other window aggregations
+  ),
+  tailHops = Array(
+    // Hourly tail hops for the last day of batch
+    Array(100.0, 1705190400000L), // Jan 14 00:00
+    Array(150.0, 1705194000000L), // Jan 14 01:00
+    // ... more hourly hops
+  )
+)
 
-# 3. Expand to tile keys (16 tiles total)
-tile_keys = [
-    "tiles::txn_count::user_123::202401041030",
-    "tiles::txn_count::user_123::202401041045",
-    # ... 14 more tiles ...
-    "tiles::txn_count::user_123::202401041430"
-]
+// Step 2: Streaming tiles for Jan 14-15
+val streamingTiles = Iterator(
+  TiledIr(1705248000000L, Array(200.0)), // Jan 14 12:00 tile
+  TiledIr(1705251600000L, Array(180.0)), // Jan 14 13:00 tile
+  TiledIr(1705255200000L, Array(220.0)), // Jan 14 14:00 tile
+  // ... more tiles up to query time
+)
 
-# 4. Parallel fetch (with 50% cache hit)
-# - 8 tiles from cache: <1ms
-# - 8 tiles from KV store: ~5ms
-
-# 5. Merge results
-tile_values = [250, 275, 260, 215, 180, 195, 220, 240,
-               255, 265, 270, 280, 290, 285, 275, 268]
-total_count = sum(tile_values)  # 4,023 transactions
-
-# Total latency: ~6ms (vs 500ms without tiling)
+// Step 3: Merge process
+// - Start with batch collapsed: 5000.0
+// - Add tail hops from Jan 14: +1200.0
+// - Add streaming tiles: +600.0
+// Final 7-day sum = 6800.0
 ```
 
 ## Performance Analysis: Real-World Impact

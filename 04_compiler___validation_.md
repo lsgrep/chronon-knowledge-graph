@@ -13,8 +13,8 @@ Imagine you're building a fraud detection system with hundreds of features:
 The challenge isn't just defining these features - it's orchestrating them across:
 - **Multiple data formats**: Avro, Parquet, JSON, Thrift
 - **Different compute engines**: Spark for batch, Flink for streaming
-- **Storage systems**: HDFS, S3, Kafka, KV stores (Redis/Cassandra)
-- **Serving layers**: REST APIs, gRPC Fetcher services
+- **Storage systems**: HDFS, S3, Kafka, KV stores (Redis/Cassandra/BigTable)
+- **Serving layers**: REST APIs, HTTP-based Fetcher services
 
 One misconfiguration could cascade failures across your entire ML infrastructure! The Compiler & Validation system prevents this by providing:
 - **Type-safe schema evolution** with Avro/Thrift
@@ -42,7 +42,6 @@ graph TB
     subgraph "Serialization Layer"
         THRIFT[Thrift Definitions]
         AVRO[Avro Schemas]
-        PROTO[Protobuf Messages]
     end
     
     subgraph "Execution Layer"
@@ -58,10 +57,9 @@ graph TB
     OPTIMIZE --> CODEGEN
     CODEGEN --> THRIFT
     CODEGEN --> AVRO
-    CODEGEN --> PROTO
     THRIFT --> SPARK
     AVRO --> FLINK
-    PROTO --> FETCHER
+    THRIFT --> FETCHER
     SPARK --> KV
     FLINK --> KV
 ```
@@ -71,7 +69,8 @@ graph TB
 Chronon uses different serialization formats for different purposes:
 
 ```python
-# 1. Thrift for configuration interchange
+# 1. Thrift for configuration interchange AND data serialization
+# Thrift is used for both config definitions and feature data
 struct GroupByConfig {
     1: required string name
     2: required list<Source> sources
@@ -81,7 +80,8 @@ struct GroupByConfig {
     6: optional OnlineConfig onlineConfig
 }
 
-# 2. Avro for data serialization
+# 2. Avro for schema evolution and data interchange
+# Used primarily for Kafka/streaming data and schema registry integration
 {
     "type": "record",
     "name": "FeatureRow",
@@ -168,7 +168,7 @@ struct KVStoreConfig {
 
 ### Stage 2: Schema Evolution and Avro Integration
 
-Chronon uses Avro for data serialization, providing schema evolution capabilities:
+Chronon uses Avro primarily for streaming data (Kafka/Flink) and schema evolution capabilities, while Thrift is used for KV store serialization:
 
 ```python
 # The compiler generates Avro schemas for feature data
@@ -243,11 +243,11 @@ class UserActivityFeaturesJob extends ChrononBatchJob {
   override def writeToKVStore(df: DataFrame): Unit = {
     df.foreachPartition { partition =>
       val kvClient = KVStoreClientFactory.create(kvStoreConfig)
-      val avroWriter = new AvroWriter(avroSchema)
+      val thriftSerializer = new TCompactSerializer()  // Thrift for KV store
       
       partition.foreach { row =>
         val key = row.getString(0)  // user_id
-        val value = avroWriter.serialize(row)
+        val value = thriftSerializer.serialize(row)
         kvClient.put(key, value, ttlSeconds)
       }
     }
@@ -265,10 +265,10 @@ public class UserActivityStreamingJob extends ChrononStreamingJob {
     
     @Override
     public DataStream<FeatureRow> processStream(StreamExecutionEnvironment env) {
-        // Connect to Kafka with Avro deserialization
+        // Connect to Kafka with Avro deserialization (for streaming data)
         FlinkKafkaConsumer<Transaction> kafkaSource = new FlinkKafkaConsumer<>(
             "transactions-stream",
-            new AvroDeserializationSchema<>(Transaction.class),
+            new AvroDeserializationSchema<>(Transaction.class),  // Avro for Kafka
             kafkaProperties
         );
         
@@ -288,6 +288,7 @@ public class UserActivityStreamingJob extends ChrononStreamingJob {
             .map(new FeatureRowMapper());
         
         // Write to KV store with exactly-once semantics
+        // KVStoreSink uses Thrift serialization internally
         aggregated.addSink(new KVStoreSink(kvStoreConfig));
         
         return aggregated;
@@ -297,28 +298,18 @@ public class UserActivityStreamingJob extends ChrononStreamingJob {
 
 ### Stage 5: Fetcher Service Integration
 
-The compiler generates Fetcher service configurations for low-latency serving:
+The compiler generates Fetcher service configurations for low-latency serving using HTTP/REST APIs:
 
-```proto
-// Generated Protobuf for Fetcher Service
-syntax = "proto3";
-
-service FeatureService {
-    rpc GetFeatures(GetFeaturesRequest) returns (GetFeaturesResponse);
-    rpc GetBatchFeatures(GetBatchFeaturesRequest) returns (GetBatchFeaturesResponse);
-}
-
-message GetFeaturesRequest {
-    string feature_group = 1;  // "user_activity_features"
-    repeated string keys = 2;  // ["user_123"]
-    int64 timestamp = 3;       // For point-in-time queries
-}
-
-message GetFeaturesResponse {
-    map<string, FeatureVector> features = 1;
-    int64 latency_ms = 2;
-    string version = 3;
-}
+```python
+# Fetcher service configuration (not protobuf - uses HTTP/JSON)
+class FetcherServiceConfig:
+    def __init__(self):
+        self.endpoints = {
+            "/v1/fetch/join/{join_name}": "Fetch join features",
+            "/v1/fetch/groupby/{groupby_name}": "Fetch groupby features"
+        }
+        self.serialization = "thrift_compact"  # Uses Thrift for data serialization
+        self.transport = "http"  # HTTP transport, not gRPC
 ```
 
 The Fetcher service implementation:
@@ -327,7 +318,7 @@ The Fetcher service implementation:
 class ChrononFetcherService:
     def __init__(self):
         self.kv_clients = {}  # Pool of KV store connections
-        self.schema_registry = SchemaRegistry()
+        self.thrift_deserializer = TCompactDeserializer()  # Thrift for serialization
         self.cache = LRUCache(maxsize=10000)  # Feature cache
         
     async def get_features(self, request):
@@ -343,14 +334,13 @@ class ChrononFetcherService:
             for key in request.keys
         ]
         
-        # Deserialize with Avro schema
-        schema = self.schema_registry.get_schema(request.feature_group)
+        # Deserialize with Thrift (not Avro for KV store data)
         results = await asyncio.gather(*futures)
         
         features = {}
         for key, value in zip(request.keys, results):
             if value:
-                features[key] = self.deserialize_avro(value, schema)
+                features[key] = self.deserialize_thrift(value)
         
         # Update cache
         self.cache[cache_key] = features
@@ -498,7 +488,7 @@ compiled/
 │   ├── fraud_detection_v2.thrift       # Thrift IDL definition
 │   └── fraud_detection_v2_serving.thrift
 ├── avro/
-│   ├── fraud_detection_v2.avsc         # Avro schema
+│   ├── fraud_detection_v2.avsc         # Avro schema (for streaming)
 │   └── fraud_detection_v2_evolution.json
 ├── spark/
 │   ├── FraudDetectionV2BatchJob.scala  # Spark batch job
@@ -528,7 +518,7 @@ class KVStoreWriter:
     def __init__(self, store_config):
         self.store_type = store_config.store_type
         self.client = self._create_client(store_config)
-        self.serializer = AvroSerializer(store_config.schema)
+        self.serializer = ThriftCompactSerializer()  # Thrift for KV store serialization
         self.ttl = store_config.ttl_seconds
         
     def write_batch(self, feature_df):
@@ -583,6 +573,14 @@ class KVStoreWriter:
             # Wait for all writes
             for future in futures:
                 future.result()
+                
+        elif self.store_type == "BIGTABLE":
+            # BigTable uses protobuf internally (Google's storage layer)
+            # But Chronon data is still serialized with Thrift
+            for key, value in batch:
+                mutation = RowMutation(key)
+                mutation.set_cell("cf", "data", value, timestamp=now())
+                self.client.mutate_row(mutation)
 ```
 
 ### KV Store Schema Management
