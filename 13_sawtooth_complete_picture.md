@@ -295,19 +295,160 @@ Total: 41 reads + 100 events (vs 6 million events!)
 Latency: ~5 milliseconds (1000x faster!)
 ```
 
+## Critical Component: Tail Hops Logic
+
+### What Are Tail Hops?
+
+Tail hops are a crucial optimization that handles the partial windows at the boundary between batch and streaming data. They store pre-aggregated values for the "tail" portion of windows that extend beyond the batch boundary.
+
+### The Problem Tail Hops Solve
+
+Consider this scenario:
+```
+Batch End Time: Jan 14 00:00:00 (midnight)
+Query Time: Jan 15 14:32:00
+7-Day Window: Jan 8 14:32:00 to Jan 15 14:32:00
+
+Problem: The window starts at Jan 8 14:32:00, but our batch data 
+         is organized in daily/hourly hops aligned to boundaries!
+         
+The window tail (Jan 8 14:32:00 to Jan 9 00:00:00) doesn't align 
+with hop boundaries!
+```
+
+### How Tail Hops Work
+
+From `SawtoothMutationAggregator.scala`:
+
+```scala
+case class BatchIr(
+  collapsed: Array[Any],      // Pre-aggregated values up to tailBuffer point
+  tailHops: HopsAggregator.IrMapType  // Fine-grained hops for the tail
+)
+
+// tailBufferMillis = 2 days by default
+val tailBufferMillis: Long = new Window(2, TimeUnit.DAYS).millis
+```
+
+The system maintains two parts:
+1. **Collapsed IR**: Fully aggregated data up to (batchEndTs - window - tailBuffer)
+2. **Tail Hops**: Fine-grained hops for the last portion of the window
+
+### Visual Representation of Tail Hops
+
+```
+7-Day Window Query at Jan 15 14:32:00:
+
+Batch End: Jan 14 00:00:00
+                                          
+Window:  [Jan 8 14:32 ----------------------- Jan 15 14:32]
+          ^                                                ^
+          Window Start                                Query Time
+
+Components:
+1. Collapsed IR (Jan 8 14:32 to Jan 12 00:00):
+   [████████████████████████████████████]
+   Pre-aggregated, single value
+   
+2. Tail Hops (Jan 12 00:00 to Jan 14 00:00):
+   [▓][▓][▓][▓][▓][▓][▓][▓]...[▓][▓]
+   Hourly hops kept separately
+   
+3. Streaming (Jan 14 00:00 to Jan 15 14:32):
+   Real-time from Flink
+
+Why 2-day tail buffer?
+- Allows precise window alignment
+- Handles late-arriving data
+- Enables exact window boundaries
+```
+
+### The Tail Hops Merge Process
+
+From `mergeTailHops` method (lines 154-179):
+
+```scala
+def mergeTailHops(ir: Array[Any], queryTs: Long, batchEndTs: Long, 
+                  batchIr: FinalBatchIr): Array[Any] = {
+  var i: Int = 0
+  while (i < windowedAggregator.length) {
+    val windowMillis = windowMappings(i).millis  // e.g., 7 days
+    val window = windowMappings(i).aggregationPart.window
+    
+    if (window != null) {  // Only for windowed aggregations
+      val hopIndex = tailHopIndices(i)
+      // Calculate where the window tail should start
+      val queryTail = TsUtils.round(queryTs - windowMillis, hopSizes(hopIndex))
+      
+      // Collect relevant tail hops
+      val relevantHops = mutable.ArrayBuffer[Any](ir(i))
+      for (hopIr <- batchIr.tailHops(hopIndex)) {
+        val hopStart = hopIr.last.asInstanceOf[Long]
+        
+        // Check if this hop falls within our window
+        if ((batchEndTs - windowMillis) + tailBufferMillis > hopStart && 
+            hopStart >= queryTail) {
+          relevantHops += hopIr(baseIrIndices(i))
+        }
+      }
+      
+      // Merge all relevant hops
+      val merged = windowedAggregator(i).bulkMerge(relevantHops.iterator)
+      ir.update(i, merged)
+    }
+    i += 1
+  }
+  ir
+}
+```
+
+### Example: How Tail Hops Enable Precise Windows
+
+```
+Query 1 at 14:32:00:
+Window needs: Jan 8 14:32:00 to Jan 15 14:32:00
+
+Without Tail Hops:
+Window would snap to: Jan 8 00:00:00 to Jan 15 14:32:00
+Error: Extra 14 hours 32 minutes of data included!
+
+With Tail Hops:
+1. Use collapsed IR up to Jan 12 00:00
+2. Add tail hops from Jan 12 00:00 to Jan 14 00:00
+3. Skip the hop from Jan 8 00:00-14:32 (before window start)
+4. Add streaming data from Jan 14 00:00 to Jan 15 14:32
+Result: Exact window!
+
+Query 2 at 14:35:00 (3 minutes later):
+Window needs: Jan 8 14:35:00 to Jan 15 14:35:00
+
+Tail hops automatically adjust:
+- Now includes the Jan 8 14:00-15:00 hop (partially)
+- Precise alignment maintained!
+```
+
+### Why Tail Hops Are Brilliant
+
+1. **Precision**: Enable exact window boundaries despite hop granularity
+2. **Efficiency**: Avoid recomputing the entire window
+3. **Flexibility**: Support any window size with any hop granularity
+4. **Correctness**: Handle partial hop inclusion correctly
+
 ## Conclusion
 
 The SawtoothAggregator achieves its magic through:
 
 1. **Multi-granularity Hops**: Different time resolutions for different data ages
-2. **Batch-Streaming Hybrid**: Spark for batch hops, Flink for real-time head
-3. **Smart Caching**: Reuse hops across queries as the window slides
-4. **Graduated Precision**: Maximum precision where it matters (recent data)
+2. **Tail Hops**: Precise window boundary handling
+3. **Batch-Streaming Hybrid**: Spark for batch hops, Flink for real-time head
+4. **Smart Caching**: Reuse hops across queries as the window slides
+5. **Graduated Precision**: Maximum precision where it matters (recent data)
 
 This design enables Chronon to serve 7-day aggregations with:
 - **Sub-10ms latency** (vs seconds for full computation)
 - **Real-time accuracy** (sub-second freshness)
+- **Exact window boundaries** (via tail hops)
 - **Massive scale** (millions of entities, billions of events)
 - **Cost efficiency** (1000x fewer operations)
 
-The "sawtooth" pattern is the visual manifestation of this optimization - a small price in tail precision for massive gains in performance and real-time accuracy.
+The "sawtooth" pattern is the visual manifestation of this optimization - a small price in tail precision for massive gains in performance and real-time accuracy, while tail hops ensure we maintain exact window boundaries despite the hop-based architecture.
