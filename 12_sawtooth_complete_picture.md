@@ -8,40 +8,40 @@ The SawtoothAggregator's genius lies in using **different granularities of pre-a
 
 ### What Actually Creates the Sawtooth
 
-The sawtooth pattern emerges from using progressively finer-grained hops as we approach the present:
+The sawtooth pattern emerges from using progressively finer-grained hops as we approach the present. The key insight is that **the actual 7-day window slides continuously with the query time**, but the **hop boundaries are fixed** (daily at midnight, hourly at :00, etc.), creating a mismatch that grows and then resets:
 
 ```
-7-Day Window Components at Different Query Times:
+7-Day Sliding Window at Different Query Times:
 
-Query at Day 7, 14:32:00:
-|<--------------------------- 7 days ---------------------------->|
-[DAILY HOPS ][DAILY][HOURLY HOPS............][5-MIN][FLINK STREAM]
- Day 1-5      Day 6  Day 7 (00:00-14:00)    14:00-  14:30-14:32
- (5 hops)     (1)    (14 hops)              14:30   (real-time)
-                                             (6)     
-
-Window starts at: Day 1, 00:00:00 (daily hop boundary)
-
-
-Query at Day 7, 15:32:00 (1 hour later):
-|<--------------------------- 7 days ---------------------------->|
-[DAILY HOPS ][DAILY][HOURLY HOPS.............][5-MIN][FLINK STREAM]
- Day 1-5      Day 6  Day 7 (00:00-15:00)     15:00-  15:30-15:32
- (5 hops)     (1)    (15 hops)               15:30   (real-time)
-                                              (6)     
-
-Window STILL starts at: Day 1, 00:00:00 (same daily hop!)
+Query at Jan 7, 14:32:00:
+Window Range: Jan 0 14:32:00 → Jan 7 14:32:00
+        |<--------------------------- 7 days ---------------------------->|
+Jan 0   Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7
+[DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY HOPS...][5-MIN][FLINK]
+                                          (Jan 6-7)      14:00- 14:30-
+                                                         14:30  14:32
+Window starts at: Jan 0, 14:32 → Snaps to Jan 1, 00:00 (daily boundary)
 
 
-Query at Day 8, 00:32:00 (next day):
-     |<--------------------------- 7 days ---------------------------->|
-     [DAILY HOPS ][DAILY][HOURLY HOPS............][5-MIN][FLINK STREAM]
-      Day 2-6      Day 7  Day 8 (00:00-00:00)    00:00-  00:30-00:32
-      (5 hops)     (1)    (0 hops)               00:30   (real-time)
-                                                  (6)     
+Query at Jan 7, 15:32:00 (1 hour later):
+Window Range: Jan 0 15:32:00 → Jan 7 15:32:00  
+        |<--------------------------- 7 days ---------------------------->|
+Jan 0   Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7
+[DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY HOPS...][5-MIN][FLINK]
+                                          (Jan 6-7)      15:00- 15:30-
+                                                         15:30  15:32
+Window starts at: Jan 0, 15:32 → STILL snaps to Jan 1, 00:00!
 
-Window NOW starts at: Day 2, 00:00:00 (jumped forward by 1 day!)
-This is the "tooth" in the sawtooth!
+
+Query at Jan 8, 00:32:00 (next day):
+Window Range: Jan 1 00:32:00 → Jan 8 00:32:00
+             |<--------------------------- 7 days ---------------------------->|
+     Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7   Jan 8
+     [DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY...][5-MIN][FLINK]
+                                                (Jan 7-8) 00:00- 00:30-
+                                                          00:30  00:32
+Window starts at: Jan 1, 00:32 → Snaps to Jan 2, 00:00 (jumped 1 day!)
+This creates the "tooth" in the sawtooth pattern!
 ```
 
 ## The Complete Architecture: Batch + Streaming
@@ -72,6 +72,26 @@ graph TB
     F --> SA
     T --> SA
     SA --> R
+```
+
+## How Sliding Windows Map to Fixed Hop Boundaries
+
+### The Core Challenge
+
+```
+ACTUAL SLIDING WINDOW (moves with query time):
+Query at 14:32 → Window: [Jan 8 14:32 ────────→ Jan 15 14:32]
+Query at 14:35 → Window: [Jan 8 14:35 ────────→ Jan 15 14:35]  (slid 3 minutes)
+
+FIXED HOP BOUNDARIES (aligned to time boundaries):
+Daily hops:  [Jan 8 00:00][Jan 9 00:00][Jan 10 00:00]...[Jan 15 00:00]
+Hourly hops: [...][14:00][15:00][16:00]...
+5-min hops:  [...][14:30][14:35][14:40]...
+
+THE MISMATCH:
+Window needs: Jan 8 14:32 (precise)
+Daily hop offers: Jan 8 00:00 (14.5 hours too early!) 
+Solution: Use tail hops for precise alignment
 ```
 
 ## Deep Dive: How Different Hop Granularities Work
@@ -218,18 +238,28 @@ Flink Stream   | Flink      | Minimal | <1 sec  | Continuous
 The "sawtooth" pattern represents a brilliant trade-off:
 
 ```
-Window Start Precision Over Time:
+Window Start Precision Loss Over Time (The Sawtooth Pattern):
+
+Example: 7-day window with daily hops at window start
 
 Precision
-Loss (min)
-    60 |      ╱│      ╱│      ╱│
-       |     ╱ │     ╱ │     ╱ │  <- Precision degrades gradually
-    30 |    ╱  │    ╱  │    ╱  │
-       |   ╱   │   ╱   │   ╱   │
-     0 |__╱    │__╱    │__╱    │  <- Snaps to new boundary
-       └────────┴────────┴────────
-         Hour 1   Hour 2   Hour 3
-         
+Gap (hours)
+    24 |────────────────────────────╮
+       |                            │  <- Window jumps to next daily hop
+    18 |                  ╱╱╱╱╱╱╱╱╱╱│
+       |                ╱╱          │
+    12 |              ╱╱            │
+       |            ╱╱              │  <- Precision gap grows over time
+     6 |          ╱╱                │
+       |        ╱╱                  │
+     0 |──────╱╱────────────────────┴──
+       └─────────────────────────────────
+       Query   +6hrs  +12hrs  +18hrs  +24hrs
+       Time                           (next day)
+       
+The window start stays at the same daily hop boundary for 24 hours,
+then suddenly jumps to the next day's boundary (the "tooth")!
+
 Trade-off:
 - ✅ Massive performance gain (100-1000x)
 - ✅ Real-time precision at the head (window end)
@@ -349,33 +379,41 @@ The system maintains two parts:
 7-Day Window Query at Jan 15 14:32:00:
 
 Timeline:
-        Jan 7      Jan 8      Jan 9     Jan 12    Jan 14    Jan 15
-         00:00     14:32      00:00      00:00     00:00     14:32
-          |         |          |          |         |         |
-          v         v          v          v         v         v
-    [tail buffer][WINDOW START]      [collapsed][batch end][query]
+Jan 6   Jan 7   Jan 8         Jan 9   Jan 10  Jan 11  Jan 12  Jan 13  Jan 14  Jan 15
+00:00   00:00   00:00  14:32  00:00   00:00   00:00   00:00   00:00   00:00   14:32
+  |       |       |      |      |       |       |       |       |       |       |
+  v       v       v      v      v       v       v       v       v       v       v
+[buffer][tail hops start]|[window start]                      [batch end][query time]
           
-Window:            [============7 day window================]
-                   ^                                         ^
-                   Jan 8 14:32                       Jan 15 14:32
-                   (Window TAIL/START)               (Window HEAD/END)
+Actual 7-Day Window:      [=================== 7 day window ===================]
+                          ^                                                      ^
+                    Jan 8 14:32                                          Jan 15 14:32
+                    (Window START/TAIL)                                  (Window END/HEAD)
 
 Batch Data Structure (stored up to Jan 14 00:00):
 
-1. TAIL HOPS (Jan 7 00:00 to Jan 9 00:00):
-   [▓][▓][▓][▓][▓][▓][▓][▓][▓][▓][▓][▓]...
-   Hourly/5-min hops for precise window START
-   Only hops >= Jan 8 14:00 are included in window
+1. TAIL HOPS (Jan 6 00:00 to Jan 9 00:00):
+   Purpose: Fine-grained hops for precise window START alignment
+   [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓]
+   Jan 6        Jan 7        Jan 8        Jan 9
+   (buffer)     (buffer)     (used)       (used)
+   
+   Only hops from Jan 8 14:32 onwards are merged into the result
    
 2. COLLAPSED IR (Jan 9 00:00 to Jan 14 00:00):
-   [████████████████████████████████████████]
-   5 days of fully pre-aggregated data
+   Purpose: Bulk of window data, fully pre-aggregated
+   [████████████████████████████████████████████████████████████]
+   Jan 9    Jan 10    Jan 11    Jan 12    Jan 13    Jan 14
+   (5 days of fully aggregated data)
    
 3. STREAMING DATA (Jan 14 00:00 to Jan 15 14:32):
-   Handled by Flink real-time (not in batch)
+   Purpose: Real-time head of the window
+   [~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~]
+   Jan 14 00:00 → Jan 15 14:32
+   (Handled by Flink in real-time)
 
-The 2-day tail buffer ensures fine-grained hops
-are available wherever the window might start!
+The 2-day tail buffer (Jan 6-8) ensures fine-grained hops
+are available for any possible window start position!
 ```
 
 ### The Tail Hops Merge Process
@@ -428,11 +466,10 @@ Window would snap to: Jan 8 00:00:00 to Jan 15 14:32:00
 Error: Extra 14 hours 32 minutes of data included!
 
 With Tail Hops:
-1. Use collapsed IR up to Jan 12 00:00
-2. Add tail hops from Jan 12 00:00 to Jan 14 00:00
-3. Skip the hop from Jan 8 00:00-14:32 (before window start)
-4. Add streaming data from Jan 14 00:00 to Jan 15 14:32
-Result: Exact window!
+1. Use tail hops from Jan 8 14:32 to Jan 9 00:00 (precise start)
+2. Add collapsed IR from Jan 9 00:00 to Jan 14 00:00 (bulk data)
+3. Add streaming data from Jan 14 00:00 to Jan 15 14:32 (real-time)
+Result: Exact window with precise boundaries!
 
 Query 2 at 14:35:00 (3 minutes later):
 Window needs: Jan 8 14:35:00 to Jan 15 14:35:00
