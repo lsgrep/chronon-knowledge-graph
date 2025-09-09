@@ -13,34 +13,37 @@ The sawtooth pattern emerges from using progressively finer-grained hops as we a
 ```
 7-Day Sliding Window at Different Query Times:
 
-Query at Jan 7, 14:32:00:
-Window Range: Jan 0 14:32:00 → Jan 7 14:32:00
+Query at Jan 14, 14:32:00:
+Actual Window: [Jan 7 14:32:00 ────────────────→ Jan 14 14:32:00]
         |<--------------------------- 7 days ---------------------------->|
-Jan 0   Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7
+Jan 7   Jan 8   Jan 9   Jan 10  Jan 11  Jan 12  Jan 13  Jan 14
 [DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY HOPS...][5-MIN][FLINK]
-                                          (Jan 6-7)      14:00- 14:30-
+                                          (Jan 13-14)    14:00- 14:30-
                                                          14:30  14:32
-Window starts at: Jan 0, 14:32 → Snaps to Jan 1, 00:00 (daily boundary)
+Actual window starts: Jan 7, 14:32
+Used hop starts: Jan 8, 00:00 (daily boundary - loses ~9.5 hours precision!)
 
 
-Query at Jan 7, 15:32:00 (1 hour later):
-Window Range: Jan 0 15:32:00 → Jan 7 15:32:00  
+Query at Jan 14, 15:32:00 (1 hour later):
+Actual Window: [Jan 7 15:32:00 ────────────────→ Jan 14 15:32:00]  
         |<--------------------------- 7 days ---------------------------->|
-Jan 0   Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7
+Jan 7   Jan 8   Jan 9   Jan 10  Jan 11  Jan 12  Jan 13  Jan 14
 [DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY HOPS...][5-MIN][FLINK]
-                                          (Jan 6-7)      15:00- 15:30-
+                                          (Jan 13-14)    15:00- 15:30-
                                                          15:30  15:32
-Window starts at: Jan 0, 15:32 → STILL snaps to Jan 1, 00:00!
+Actual window starts: Jan 7, 15:32
+Used hop STILL starts: Jan 8, 00:00 (same daily boundary!)
 
 
-Query at Jan 8, 00:32:00 (next day):
-Window Range: Jan 1 00:32:00 → Jan 8 00:32:00
+Query at Jan 15, 00:32:00 (next day):
+Actual Window: [Jan 8 00:32:00 ────────────────→ Jan 15 00:32:00]
              |<--------------------------- 7 days ---------------------------->|
-     Jan 1   Jan 2   Jan 3   Jan 4   Jan 5   Jan 6   Jan 7   Jan 8
+     Jan 8   Jan 9   Jan 10  Jan 11  Jan 12  Jan 13  Jan 14  Jan 15
      [DAILY ][DAILY ][DAILY ][DAILY ][DAILY ][HOURLY...][5-MIN][FLINK]
-                                                (Jan 7-8) 00:00- 00:30-
-                                                          00:30  00:32
-Window starts at: Jan 1, 00:32 → Snaps to Jan 2, 00:00 (jumped 1 day!)
+                                                (Jan 14-15) 00:00- 00:30-
+                                                           00:30  00:32
+Actual window starts: Jan 8, 00:32
+Used hop NOW starts: Jan 9, 00:00 (jumped to next daily boundary!)
 This creates the "tooth" in the sawtooth pattern!
 ```
 
@@ -250,7 +253,7 @@ Gap (hours)
        |                ╱╱          │
     12 |              ╱╱            │
        |            ╱╱              │  <- Precision gap grows over time
-     6 |          ╱╱                │
+     6 |          ╱╱                │      (without tail hops)
        |        ╱╱                  │
      0 |──────╱╱────────────────────┴──
        └─────────────────────────────────
@@ -263,7 +266,7 @@ then suddenly jumps to the next day's boundary (the "tooth")!
 Trade-off:
 - ✅ Massive performance gain (100-1000x)
 - ✅ Real-time precision at the head (window end)
-- ⚠️ Up to 1 hour imprecision at the tail/start (acceptable for 7-day window)
+- ⚠️ Up to 24 hours imprecision at the tail/start without tail hops (mitigated by tail hops)
 - ✅ Tail hops ensure exact window boundaries despite hop granularity
 ```
 
