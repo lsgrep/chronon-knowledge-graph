@@ -76,11 +76,11 @@ graph TB
 
 ## Deep Dive: How Different Hop Granularities Work
 
-### 1. The Tail: Daily Hops (Days 1-5 of 7-day window)
+### 1. The Oldest Data: Daily Hops (Days 1-5 of 7-day window)
 
 ```scala
 // From SawtoothAggregator.genIr() method
-// For old data, use coarse-grained daily hops
+// For old data (window tail/start), use coarse-grained daily hops
 val dailyHops = hopsArrays(2)  // Index 2 = daily hops
 // Each daily hop contains pre-aggregated IR for 24 hours
 // Example: sum=1.2M, count=35K, min=0.01, max=5000
@@ -232,8 +232,9 @@ Loss (min)
          
 Trade-off:
 - ✅ Massive performance gain (100-1000x)
-- ✅ Real-time precision at the head
-- ⚠️ Up to 1 hour imprecision at the tail (acceptable for 7-day window)
+- ✅ Real-time precision at the head (window end)
+- ⚠️ Up to 1 hour imprecision at the tail/start (acceptable for 7-day window)
+- ✅ Tail hops ensure exact window boundaries despite hop granularity
 ```
 
 ## Configuration in Production
@@ -299,7 +300,7 @@ Latency: ~5 milliseconds (1000x faster!)
 
 ### What Are Tail Hops?
 
-Tail hops are a crucial optimization that handles the partial windows at the boundary between batch and streaming data. They store pre-aggregated values for the "tail" portion of windows that extend beyond the batch boundary.
+Tail hops are fine-grained pre-aggregated values stored for the **START (tail) of the window** - the oldest part. The "tail" refers to the beginning of the window in time, not the end. They enable precise window start alignment when the window doesn't align with coarse hop boundaries (like daily hops).
 
 ### The Problem Tail Hops Solve
 
@@ -309,11 +310,11 @@ Batch End Time: Jan 14 00:00:00 (midnight)
 Query Time: Jan 15 14:32:00
 7-Day Window: Jan 8 14:32:00 to Jan 15 14:32:00
 
-Problem: The window starts at Jan 8 14:32:00, but our batch data 
-         is organized in daily/hourly hops aligned to boundaries!
+Problem: The window starts at Jan 8 14:32:00, but our daily hops 
+         are aligned to midnight boundaries (Jan 8 00:00:00)!
          
-The window tail (Jan 8 14:32:00 to Jan 9 00:00:00) doesn't align 
-with hop boundaries!
+Without tail hops: Would include extra data from Jan 8 00:00 to 14:32
+With tail hops: Precise alignment at Jan 8 14:32
 ```
 
 ### How Tail Hops Work
@@ -322,45 +323,59 @@ From `SawtoothMutationAggregator.scala`:
 
 ```scala
 case class BatchIr(
-  collapsed: Array[Any],      // Pre-aggregated values up to tailBuffer point
-  tailHops: HopsAggregator.IrMapType  // Fine-grained hops for the tail
+  collapsed: Array[Any],      // Bulk of window data, fully aggregated
+  tailHops: HopsAggregator.IrMapType  // Fine-grained hops for window START
 )
+
+// Calculate where the window tail (start) is:
+def tailTs(batchEndTs: Long): Array[Option[Long]] =
+  windowMappings.map { mapping => 
+    Option(mapping.aggregationPart.window).map { 
+      batchEndTs - _.millis  // Jan 14 - 7 days = Jan 7 (with buffer)
+    } 
+  }
 
 // tailBufferMillis = 2 days by default
 val tailBufferMillis: Long = new Window(2, TimeUnit.DAYS).millis
 ```
 
 The system maintains two parts:
-1. **Collapsed IR**: Fully aggregated data up to (batchEndTs - window - tailBuffer)
-2. **Tail Hops**: Fine-grained hops for the last portion of the window
+1. **Tail Hops**: Fine-grained hops around the window START for precise alignment
+2. **Collapsed IR**: Fully aggregated data for the bulk of the window (middle portion)
 
-### Visual Representation of Tail Hops
+### Visual Representation of Tail Hops (CORRECTED)
 
 ```
 7-Day Window Query at Jan 15 14:32:00:
 
-Batch End: Jan 14 00:00:00
-                                          
-Window:  [Jan 8 14:32 ----------------------- Jan 15 14:32]
-          ^                                                ^
-          Window Start                                Query Time
+Timeline:
+        Jan 7      Jan 8      Jan 9     Jan 12    Jan 14    Jan 15
+         00:00     14:32      00:00      00:00     00:00     14:32
+          |         |          |          |         |         |
+          v         v          v          v         v         v
+    [tail buffer][WINDOW START]      [collapsed][batch end][query]
+          
+Window:            [============7 day window================]
+                   ^                                         ^
+                   Jan 8 14:32                       Jan 15 14:32
+                   (Window TAIL/START)               (Window HEAD/END)
 
-Components:
-1. Collapsed IR (Jan 8 14:32 to Jan 12 00:00):
-   [████████████████████████████████████]
-   Pre-aggregated, single value
-   
-2. Tail Hops (Jan 12 00:00 to Jan 14 00:00):
-   [▓][▓][▓][▓][▓][▓][▓][▓]...[▓][▓]
-   Hourly hops kept separately
-   
-3. Streaming (Jan 14 00:00 to Jan 15 14:32):
-   Real-time from Flink
+Batch Data Structure (stored up to Jan 14 00:00):
 
-Why 2-day tail buffer?
-- Allows precise window alignment
-- Handles late-arriving data
-- Enables exact window boundaries
+1. TAIL HOPS (Jan 7 00:00 to Jan 9 00:00):
+   [▓][▓][▓][▓][▓][▓][▓][▓][▓][▓][▓][▓]...
+   Hourly/5-min hops for precise window START
+   Only hops >= Jan 8 14:00 are included in window
+   
+2. COLLAPSED IR (Jan 9 00:00 to Jan 14 00:00):
+   [████████████████████████████████████████]
+   5 days of fully pre-aggregated data
+   
+3. STREAMING DATA (Jan 14 00:00 to Jan 15 14:32):
+   Handled by Flink real-time (not in batch)
+
+The 2-day tail buffer ensures fine-grained hops
+are available wherever the window might start!
 ```
 
 ### The Tail Hops Merge Process
@@ -439,16 +454,20 @@ Tail hops automatically adjust:
 The SawtoothAggregator achieves its magic through:
 
 1. **Multi-granularity Hops**: Different time resolutions for different data ages
-2. **Tail Hops**: Precise window boundary handling
+   - Coarse (daily) for old data at window start (tail)
+   - Fine (5-min) for recent data near window end (head)
+2. **Tail Hops**: Precise window START boundary handling
+   - Fine-grained hops stored for the beginning of the window
+   - Enables exact alignment despite coarse hop boundaries
 3. **Batch-Streaming Hybrid**: Spark for batch hops, Flink for real-time head
 4. **Smart Caching**: Reuse hops across queries as the window slides
-5. **Graduated Precision**: Maximum precision where it matters (recent data)
+5. **Graduated Precision**: Maximum precision where it matters (recent data at window head)
 
 This design enables Chronon to serve 7-day aggregations with:
 - **Sub-10ms latency** (vs seconds for full computation)
-- **Real-time accuracy** (sub-second freshness)
-- **Exact window boundaries** (via tail hops)
+- **Real-time accuracy** (sub-second freshness at window head)
+- **Exact window boundaries** (tail hops handle window start precision)
 - **Massive scale** (millions of entities, billions of events)
 - **Cost efficiency** (1000x fewer operations)
 
-The "sawtooth" pattern is the visual manifestation of this optimization - a small price in tail precision for massive gains in performance and real-time accuracy, while tail hops ensure we maintain exact window boundaries despite the hop-based architecture.
+The "sawtooth" pattern is the visual manifestation of this optimization - a small price in window start precision (mitigated by tail hops) for massive gains in performance and real-time accuracy at the window head.
